@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+import os
 import argparse
 
 import multiprocessing as mp
@@ -14,6 +15,9 @@ import yaml
 
 from src.utils.multi_node_distributed import init_distributed
 from src.multi_node_train import main as app_main
+
+# Set the value of PMIX_MCA_gds
+os.environ['PMIX_MCA_gds'] = 'hash'
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -31,7 +35,7 @@ parser.add_argument(
 
 # def process_main(rank, fname, world_size, devices, args):
 def process_main(args):
-    import os
+    # import os
     #os.environ['CUDA_VISIBLE_DEVICES'] = str(devices[rank % world_size].split(':')[-1])
     #os.environ['CUDA_VISIBLE_DEVICES'] = str(0)
 
@@ -62,7 +66,7 @@ def process_main(args):
 
     logger.info(f'Running... (rank: {rank}/{world_size})')
     # app_main(args=params)
-    app_main(args=params, gpu=int(os.environ["LOCAL_RANK"]))
+    app_main(args=params, world_size=world_size, rank=rank, gpu=int(os.environ["LOCAL_RANK"]))
     # app_main(args=params, gpu=rank%world_size)
     # app_main(args=params, gpu=rank)
 

@@ -36,7 +36,7 @@ from src.masks.utils import apply_masks
     # AllReduce
 # )
 from src.utils.multi_node_distributed import (
-    init_distributed,
+    # init_distributed,
     AllReduce
 )
 from src.utils.logging import (
@@ -68,7 +68,7 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
 
-def main(args, resume_preempt=False, gpu=0):
+def main(args, world_size=1, rank=0, resume_preempt=False, gpu=0):
 
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
@@ -142,7 +142,7 @@ def main(args, resume_preempt=False, gpu=0):
 
     # -- init torch distributed backend
     # world_size, rank = init_distributed()
-    world_size, rank = init_distributed(args)
+    # world_size, rank = init_distributed(args)
     logger.info(f'Initialized (rank/world-size) {rank}/{world_size}')
     if rank > 0:
         logger.setLevel(logging.ERROR)
@@ -269,10 +269,127 @@ def main(args, resume_preempt=False, gpu=0):
             if (epoch + 1) % checkpoint_freq == 0:
                 torch.save(save_dict, save_path.format(epoch=f'{epoch + 1}'))
 
+    def load_imgs():
+        # -- unsupervised imgs
+        imgs = udata[0].to(device, non_blocking=True)
+        masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
+        masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
+        return (imgs, masks_1, masks_2)
+
+
+
+    def forward_target():
+        with torch.no_grad():
+            h = target_encoder(imgs)
+            h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim
+            B = len(h)
+            # -- create targets (masked regions of h)
+            h = apply_masks(h, masks_pred)
+            h = repeat_interleave_batch(h, B, repeat=len(masks_enc))
+            return h
+
+    def forward_context():
+        z = encoder(imgs, masks_enc)
+        z = predictor(z, masks_enc, masks_pred)
+        return z
+
+    def loss_fn(z, h):
+        loss = F.smooth_l1_loss(z, h)
+        loss = AllReduce.apply(loss)
+        return loss
+
+
+
+
+    def train_step():
+        _new_lr = scheduler.step()
+        _new_wd = wd_scheduler.step()
+        # --
+
+        # def forward_target():
+            # with torch.no_grad():
+                # h = target_encoder(imgs)
+                # h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim
+                # B = len(h)
+                # # -- create targets (masked regions of h)
+                # h = apply_masks(h, masks_pred)
+                # h = repeat_interleave_batch(h, B, repeat=len(masks_enc))
+                # return h
+
+        # def forward_context():
+            # z = encoder(imgs, masks_enc)
+            # z = predictor(z, masks_enc, masks_pred)
+            # return z
+
+        # def loss_fn(z, h):
+            # loss = F.smooth_l1_loss(z, h)
+            # loss = AllReduce.apply(loss)
+            # return loss
+
+        # Step 1. Forward
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
+            h = forward_target()
+            z = forward_context()
+            loss = loss_fn(z, h)
+
+        #  Step 2. Backward & step
+        if use_bfloat16:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+        grad_stats = grad_logger(encoder.named_parameters())
+        optimizer.zero_grad()
+
+        # Step 3. momentum update of target encoder
+        with torch.no_grad():
+            m = next(momentum_scheduler)
+            for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
+                param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
+
+        return (float(loss), _new_lr, _new_wd, grad_stats)
+
+
+
+
+
+    # -- Logging
+    def log_stats():
+        csv_logger.log(epoch + 1, itr, loss, maskA_meter.val, maskB_meter.val, etime)
+        if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
+            logger.info('[%d, %5d] loss: %.3f '
+                        'masks: %.1f %.1f '
+                        '[wd: %.2e] [lr: %.2e] '
+                        '[mem: %.2e] '
+                        '(%.1f ms)'
+                        % (epoch + 1, itr,
+                           loss_meter.avg,
+                           maskA_meter.avg,
+                           maskB_meter.avg,
+                           _new_wd,
+                           _new_lr,
+                           torch.cuda.max_memory_allocated() / 1024.**2,
+                           time_meter.avg))
+
+            if grad_stats is not None:
+                logger.info('[%d, %5d] grad_stats: [%.2e %.2e] (%.2e, %.2e)'
+                            % (epoch + 1, itr,
+                               grad_stats.first_layer,
+                               grad_stats.last_layer,
+                               grad_stats.min,
+                               grad_stats.max))
+
+
+
+
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         logger.info('Epoch %d' % (epoch + 1))
 
+        # Set the value of PMIX_MCA_gds
+        os.environ['PMIX_MCA_gds'] = 'hash'
         # -- update distributed-data-loader epoch
         unsupervised_sampler.set_epoch(epoch)
 
@@ -283,94 +400,94 @@ def main(args, resume_preempt=False, gpu=0):
 
         for itr, (udata, masks_enc, masks_pred) in enumerate(unsupervised_loader):
 
-            def load_imgs():
-                # -- unsupervised imgs
-                imgs = udata[0].to(device, non_blocking=True)
-                masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
-                masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
-                return (imgs, masks_1, masks_2)
+            # def load_imgs():
+                # # -- unsupervised imgs
+                # imgs = udata[0].to(device, non_blocking=True)
+                # masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
+                # masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
+                # return (imgs, masks_1, masks_2)
             imgs, masks_enc, masks_pred = load_imgs()
             maskA_meter.update(len(masks_enc[0][0]))
             maskB_meter.update(len(masks_pred[0][0]))
 
-            def train_step():
-                _new_lr = scheduler.step()
-                _new_wd = wd_scheduler.step()
-                # --
+            # def train_step():
+                # _new_lr = scheduler.step()
+                # _new_wd = wd_scheduler.step()
+                # # --
 
-                def forward_target():
-                    with torch.no_grad():
-                        h = target_encoder(imgs)
-                        h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim
-                        B = len(h)
-                        # -- create targets (masked regions of h)
-                        h = apply_masks(h, masks_pred)
-                        h = repeat_interleave_batch(h, B, repeat=len(masks_enc))
-                        return h
+                # def forward_target():
+                    # with torch.no_grad():
+                        # h = target_encoder(imgs)
+                        # h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim
+                        # B = len(h)
+                        # # -- create targets (masked regions of h)
+                        # h = apply_masks(h, masks_pred)
+                        # h = repeat_interleave_batch(h, B, repeat=len(masks_enc))
+                        # return h
 
-                def forward_context():
-                    z = encoder(imgs, masks_enc)
-                    z = predictor(z, masks_enc, masks_pred)
-                    return z
+                # def forward_context():
+                    # z = encoder(imgs, masks_enc)
+                    # z = predictor(z, masks_enc, masks_pred)
+                    # return z
 
-                def loss_fn(z, h):
-                    loss = F.smooth_l1_loss(z, h)
-                    loss = AllReduce.apply(loss)
-                    return loss
+                # def loss_fn(z, h):
+                    # loss = F.smooth_l1_loss(z, h)
+                    # loss = AllReduce.apply(loss)
+                    # return loss
 
-                # Step 1. Forward
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
-                    h = forward_target()
-                    z = forward_context()
-                    loss = loss_fn(z, h)
+                # # Step 1. Forward
+                # with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
+                    # h = forward_target()
+                    # z = forward_context()
+                    # loss = loss_fn(z, h)
 
-                #  Step 2. Backward & step
-                if use_bfloat16:
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    optimizer.step()
-                grad_stats = grad_logger(encoder.named_parameters())
-                optimizer.zero_grad()
+                # #  Step 2. Backward & step
+                # if use_bfloat16:
+                    # scaler.scale(loss).backward()
+                    # scaler.step(optimizer)
+                    # scaler.update()
+                # else:
+                    # loss.backward()
+                    # optimizer.step()
+                # grad_stats = grad_logger(encoder.named_parameters())
+                # optimizer.zero_grad()
 
-                # Step 3. momentum update of target encoder
-                with torch.no_grad():
-                    m = next(momentum_scheduler)
-                    for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
-                        param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
+                # # Step 3. momentum update of target encoder
+                # with torch.no_grad():
+                    # m = next(momentum_scheduler)
+                    # for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
+                        # param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
 
-                return (float(loss), _new_lr, _new_wd, grad_stats)
+                # return (float(loss), _new_lr, _new_wd, grad_stats)
             (loss, _new_lr, _new_wd, grad_stats), etime = gpu_timer(train_step)
             loss_meter.update(loss)
             time_meter.update(etime)
 
-            # -- Logging
-            def log_stats():
-                csv_logger.log(epoch + 1, itr, loss, maskA_meter.val, maskB_meter.val, etime)
-                if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
-                    logger.info('[%d, %5d] loss: %.3f '
-                                'masks: %.1f %.1f '
-                                '[wd: %.2e] [lr: %.2e] '
-                                '[mem: %.2e] '
-                                '(%.1f ms)'
-                                % (epoch + 1, itr,
-                                   loss_meter.avg,
-                                   maskA_meter.avg,
-                                   maskB_meter.avg,
-                                   _new_wd,
-                                   _new_lr,
-                                   torch.cuda.max_memory_allocated() / 1024.**2,
-                                   time_meter.avg))
+            # # -- Logging
+            # def log_stats():
+                # csv_logger.log(epoch + 1, itr, loss, maskA_meter.val, maskB_meter.val, etime)
+                # if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
+                    # logger.info('[%d, %5d] loss: %.3f '
+                                # 'masks: %.1f %.1f '
+                                # '[wd: %.2e] [lr: %.2e] '
+                                # '[mem: %.2e] '
+                                # '(%.1f ms)'
+                                # % (epoch + 1, itr,
+                                   # loss_meter.avg,
+                                   # maskA_meter.avg,
+                                   # maskB_meter.avg,
+                                   # _new_wd,
+                                   # _new_lr,
+                                   # torch.cuda.max_memory_allocated() / 1024.**2,
+                                   # time_meter.avg))
 
-                    if grad_stats is not None:
-                        logger.info('[%d, %5d] grad_stats: [%.2e %.2e] (%.2e, %.2e)'
-                                    % (epoch + 1, itr,
-                                       grad_stats.first_layer,
-                                       grad_stats.last_layer,
-                                       grad_stats.min,
-                                       grad_stats.max))
+                    # if grad_stats is not None:
+                        # logger.info('[%d, %5d] grad_stats: [%.2e %.2e] (%.2e, %.2e)'
+                                    # % (epoch + 1, itr,
+                                       # grad_stats.first_layer,
+                                       # grad_stats.last_layer,
+                                       # grad_stats.min,
+                                       # grad_stats.max))
 
             log_stats()
 
